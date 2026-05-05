@@ -1,10 +1,13 @@
+import os
 from flask import Flask
 from flask_cors import CORS
+from prometheus_flask_exporter import PrometheusMetrics
 
 from backend.config import SQLALCHEMY_DATABASE_URI, SQLALCHEMY_TRACK_MODIFICATIONS
 from backend.extensions import db
 
-# 워밍업(없어도 서버는 떠야함)
+CACHE_ENABLED = os.environ.get('CACHE_ENABLED', 'true').lower() == 'true'
+
 try:
     from backend.services.recommender_mmr import warmup_recipe_cache
 except Exception:
@@ -13,6 +16,7 @@ except Exception:
 
 def create_app():
     app = Flask(__name__)
+    metrics = PrometheusMetrics(app)
 
     app.config["SQLALCHEMY_DATABASE_URI"] = SQLALCHEMY_DATABASE_URI
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = SQLALCHEMY_TRACK_MODIFICATIONS
@@ -43,7 +47,6 @@ def create_app():
     def health():
         return {"ok": True}
 
-    # 서버 시작 전에 캐시 워밍업 (앱 컨텍스트 필요)
     if warmup_recipe_cache is not None:
         with app.app_context():
             warmup_recipe_cache(force=True)
@@ -54,6 +57,4 @@ def create_app():
 app = create_app()
 
 if __name__ == "__main__":
-    # debug=True면 리로더로 2번 실행되며 워밍업도 2번 돌아서 느려질 수 있음
-    # 개발 중이라도 느려지면 use_reloader=False 권장
     app.run(debug=True, use_reloader=False)

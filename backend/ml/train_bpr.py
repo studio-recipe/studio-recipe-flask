@@ -1,9 +1,3 @@
-"""
-BPR 기반 임베딩 학습 + DB 저장 스크립트
-실행 (프로젝트 루트에서):
-(.venv) PS> python -m backend.ml.train_bpr
-"""
-
 import os
 import random
 from collections import defaultdict
@@ -21,31 +15,9 @@ from backend.config import SQLALCHEMY_DATABASE_URI
 # ==============================
 # 0. 재현성(결정성) 고정
 # ==============================
-# SEED = int(os.environ.get("BPR_SEED", "42"))
-
-# def _seed_everything(seed: int = 42):
-#     random.seed(seed)
-#     np.random.seed(seed)
-#     torch.manual_seed(seed)
-#     torch.cuda.manual_seed_all(seed)
-
-#     # torch 결정성 강화(속도 약간 저하 가능)
-#     torch.backends.cudnn.deterministic = True
-#     torch.backends.cudnn.benchmark = False
-#     try:
-#         torch.use_deterministic_algorithms(True)
-#     except Exception:
-#         pass
-
-# _seed_everything(SEED)
-
 SEED = 42
 
 def _seed_everything(seed: int = 42):
-    import os
-    import random
-    import numpy as np
-    import torch
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -69,13 +41,8 @@ NEGATIVE_RATIO = 4
 # 2. DB에서 인터랙션 + 전체 아이템 로딩
 # ==============================
 def load_interactions_and_items():
-    """
-    - interactions: USER_REFERENCES (VIEW/LIKE)
-    - items universe: recipes 테이블 전체 rcp_sno
-    """
     engine = create_engine(SQLALCHEMY_DATABASE_URI)
 
-    # (1) 전체 레시피(아이템 우주)  ORDER BY로 순서 고정
     items_sql = """
         SELECT rcp_sno AS item_id
         FROM recipes
@@ -86,7 +53,6 @@ def load_interactions_and_items():
         raise RuntimeError("recipes 테이블에 레시피가 없습니다. 먼저 CSV 적재를 확인하세요.")
     all_item_ids = all_items_df["item_id"].astype(int).tolist()
 
-    # (2) 인터랙션  ORDER BY로 순서 고정(동일 데이터면 df 순서도 동일)
     inter_sql = """
         SELECT
             user_id,
@@ -98,22 +64,20 @@ def load_interactions_and_items():
     df = pd.read_sql(inter_sql, engine)
 
     if df.empty:
-        raise RuntimeError("USER_REFERENCES 테이블에 데이터가 없습니다. 이벤트 로그를 먼저 쌓아주세요.")
+        raise RuntimeError("USER_REFERENCES 테이블에 데이터가 없습니다.")
 
     df["user_id"] = df["user_id"].astype(int)
     df["item_id"] = df["item_id"].astype(int)
 
-    # recipes에 없는 item_id는 FK가 정상이라면 원래 없어야 하지만, 방어적으로 제거
     item_set = set(all_item_ids)
     before = len(df)
     df = df[df["item_id"].isin(item_set)].copy()
     after = len(df)
     if after == 0:
-        raise RuntimeError("USER_REFERENCES의 item_id가 recipes에 존재하지 않습니다. FK/데이터를 확인하세요.")
+        raise RuntimeError("USER_REFERENCES의 item_id가 recipes에 존재하지 않습니다.")
     if after != before:
-        print(f"recipes에 없는 item_id {before-after}건을 학습에서 제외했습니다.")
+        print(f"recipes에 없는 item_id {before - after}건을 학습에서 제외했습니다.")
 
-    # weight (원하면 LIKE 가중치 강화 가능)
     df["weight"] = df["preference_type"].apply(lambda t: 2 if t == "LIKE" else 1)
 
     return df, all_item_ids, engine
@@ -123,7 +87,6 @@ def load_interactions_and_items():
 # 3. ID → index 매핑 생성
 # ==============================
 def build_id_mappings(df: pd.DataFrame, all_item_ids: List[int]):
-    # user_id / item_id 순서 고정(정렬)
     unique_users = sorted(df["user_id"].unique().tolist())
     all_item_ids = sorted([int(x) for x in all_item_ids])
 
@@ -151,10 +114,7 @@ class BPRDataset(Dataset):
         self.item2idx = item2idx
         self.negative_ratio = negative_ratio
 
-        # 유저별 positive set
         self.user_pos_items: Dict[int, set] = defaultdict(set)
-
-        # positive_pairs: (u_idx, i_idx) 를 중복 포함(조회 여러번이면 여러 샘플로 취급)
         self.positive_pairs: List[Tuple[int, int]] = []
 
         for row in df.itertuples(index=False):
@@ -165,19 +125,17 @@ class BPRDataset(Dataset):
 
         self.num_items = len(item2idx)
 
-        # 유저별 negative 후보를 미리 만들어 무한루프 방지
         self.user_neg_candidates: Dict[int, List[int]] = {}
         all_items = set(range(self.num_items))
         for u_idx, pos_set in self.user_pos_items.items():
             negs = list(all_items - pos_set)
             self.user_neg_candidates[u_idx] = negs
 
-        # 학습 불가능 유저 체크
         for u_idx, negs in self.user_neg_candidates.items():
             if len(negs) == 0:
                 raise RuntimeError(
                     f"BPR negative sampling 불가: 유저 index {u_idx}가 아이템 우주 전체에 대해 이벤트를 보유."
-                    f" (현재 아이템 우주 크기={self.num_items})"
+                    f" (현재 아이템 크기={self.num_items})"
                 )
 
     def __len__(self):
@@ -186,10 +144,8 @@ class BPRDataset(Dataset):
     def __getitem__(self, idx):
         pos_index = idx // self.negative_ratio
         u, i_pos = self.positive_pairs[pos_index]
-
         negs = self.user_neg_candidates[u]
         j_neg = random.choice(negs)
-
         return (
             torch.LongTensor([u]),
             torch.LongTensor([i_pos]),
@@ -205,7 +161,6 @@ class BPRModel(nn.Module):
         super().__init__()
         self.user_embed = nn.Embedding(num_users, embed_dim)
         self.item_embed = nn.Embedding(num_items, embed_dim)
-
         nn.init.xavier_uniform_(self.user_embed.weight)
         nn.init.xavier_uniform_(self.item_embed.weight)
 
@@ -213,7 +168,6 @@ class BPRModel(nn.Module):
         u_e = self.user_embed(u)
         i_e = self.item_embed(i)
         j_e = self.item_embed(j)
-
         pos_score = (u_e * i_e).sum(dim=-1)
         neg_score = (u_e * j_e).sum(dim=-1)
         return pos_score, neg_score
@@ -221,10 +175,7 @@ class BPRModel(nn.Module):
     def bpr_loss(self, pos_score, neg_score, l2_lambda: float = 1e-4):
         diff = pos_score - neg_score
         loss = -torch.mean(torch.log(torch.sigmoid(diff) + 1e-8))
-
-        l2_reg = 0.0
-        for p in self.parameters():
-            l2_reg += torch.sum(p ** 2)
+        l2_reg = sum(torch.sum(p ** 2) for p in self.parameters())
         return loss + l2_lambda * l2_reg
 
 
@@ -232,17 +183,16 @@ class BPRModel(nn.Module):
 # 6. 학습
 # ==============================
 def train_bpr():
-    # 학습 시작할 때도 seed 고정(스레드 호출 시에도 재현성 유지)
     _seed_everything(SEED)
 
     df, all_item_ids, engine = load_interactions_and_items()
     print(f"USER_REFERENCES 로드 완료: {len(df)} rows")
-    print(f"recipes(아이템 우주) 크기: {len(all_item_ids)}")
+    print(f"recipes(아이템) 크기: {len(all_item_ids)}")
 
     user2idx, item2idx, idx2user, idx2item = build_id_mappings(df, all_item_ids)
     num_users = len(user2idx)
     num_items = len(item2idx)
-    print(f"유저 수: {num_users}, 레시피 수(우주): {num_items}")
+    print(f"유저 수: {num_users}, 레시피 수: {num_items}")
 
     dataset = BPRDataset(
         df[["user_id", "item_id", "weight"]],
@@ -251,7 +201,6 @@ def train_bpr():
         negative_ratio=NEGATIVE_RATIO,
     )
 
-    # DataLoader도 결정적으로(셔플은 하되 generator 고정)
     g = torch.Generator()
     g.manual_seed(SEED)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, generator=g)
@@ -265,13 +214,11 @@ def train_bpr():
         total_loss = 0.0
         for u, i_pos, j_neg in dataloader:
             u, i_pos, j_neg = u.to(device), i_pos.to(device), j_neg.to(device)
-
             optimizer.zero_grad()
             pos_score, neg_score = model(u, i_pos, j_neg)
             loss = model.bpr_loss(pos_score, neg_score)
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item()
 
         avg_loss = total_loss / max(1, len(dataloader))
@@ -285,6 +232,9 @@ def train_bpr():
     save_embeddings_to_db(engine, user_emb, item_emb, idx2user, idx2item)
 
 
+# ==============================
+# 7. 임베딩 DB 저장
+# ==============================
 def save_embeddings_to_db(
     engine,
     user_emb: np.ndarray,
@@ -295,12 +245,10 @@ def save_embeddings_to_db(
     def vec_to_str(v: np.ndarray) -> str:
         return ",".join(f"{x:.6f}" for x in v.tolist())
 
-    # 기존 데이터 삭제
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM user_embeddings"))
         conn.execute(text("DELETE FROM recipe_embeddings"))
 
-    # user_embeddings — raw SQL로 직접 INSERT (MEDIUMTEXT 보장)
     user_rows = [
         {"user_id": int(user_id), "vector": vec_to_str(user_emb[idx])}
         for idx, user_id in idx2user.items()
@@ -312,13 +260,11 @@ def save_embeddings_to_db(
         )
     print(f"user_embeddings 저장 완료: {len(user_rows)} rows")
 
-    # recipe_embeddings — raw SQL로 직접 INSERT (MEDIUMTEXT 보장)
     item_rows = [
         {"rcp_sno": int(item_id), "vector": vec_to_str(item_emb[idx])}
         for idx, item_id in idx2item.items()
     ]
 
-    # 23,192건을 한 번에 INSERT하면 메모리 초과 가능 → 청크 단위로 분할
     CHUNK_SIZE = 1000
     with engine.begin() as conn:
         for i in range(0, len(item_rows), CHUNK_SIZE):
@@ -329,13 +275,6 @@ def save_embeddings_to_db(
             )
             print(f"recipe_embeddings 저장 중: {min(i + CHUNK_SIZE, len(item_rows))}/{len(item_rows)}")
 
-    print(f"recipe_embeddings 저장 완료: {len(item_rows)} rows")
-
-    # recipe_embeddings
-    item_rows = []
-    for idx, item_id in idx2item.items():
-        item_rows.append({"rcp_sno": int(item_id), "VECTOR": vec_to_str(item_emb[idx])})
-    pd.DataFrame(item_rows).to_sql("recipe_embeddings", engine, if_exists="append", index=False)
     print(f"recipe_embeddings 저장 완료: {len(item_rows)} rows")
 
 

@@ -285,9 +285,6 @@ def train_bpr():
     save_embeddings_to_db(engine, user_emb, item_emb, idx2user, idx2item)
 
 
-# ==============================
-# 7. 임베딩 DB 저장
-# ==============================
 def save_embeddings_to_db(
     engine,
     user_emb: np.ndarray,
@@ -298,16 +295,41 @@ def save_embeddings_to_db(
     def vec_to_str(v: np.ndarray) -> str:
         return ",".join(f"{x:.6f}" for x in v.tolist())
 
+    # 기존 데이터 삭제
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM user_embeddings"))
         conn.execute(text("DELETE FROM recipe_embeddings"))
 
-    # user_embeddings
-    user_rows = []
-    for idx, user_id in idx2user.items():
-        user_rows.append({"user_id": int(user_id), "VECTOR": vec_to_str(user_emb[idx])})
-    pd.DataFrame(user_rows).to_sql("user_embeddings", engine, if_exists="append", index=False)
+    # user_embeddings — raw SQL로 직접 INSERT (MEDIUMTEXT 보장)
+    user_rows = [
+        {"user_id": int(user_id), "vector": vec_to_str(user_emb[idx])}
+        for idx, user_id in idx2user.items()
+    ]
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO user_embeddings (user_id, vector) VALUES (:user_id, :vector)"),
+            user_rows
+        )
     print(f"user_embeddings 저장 완료: {len(user_rows)} rows")
+
+    # recipe_embeddings — raw SQL로 직접 INSERT (MEDIUMTEXT 보장)
+    item_rows = [
+        {"rcp_sno": int(item_id), "vector": vec_to_str(item_emb[idx])}
+        for idx, item_id in idx2item.items()
+    ]
+
+    # 23,192건을 한 번에 INSERT하면 메모리 초과 가능 → 청크 단위로 분할
+    CHUNK_SIZE = 1000
+    with engine.begin() as conn:
+        for i in range(0, len(item_rows), CHUNK_SIZE):
+            chunk = item_rows[i:i + CHUNK_SIZE]
+            conn.execute(
+                text("INSERT INTO recipe_embeddings (rcp_sno, vector) VALUES (:rcp_sno, :vector)"),
+                chunk
+            )
+            print(f"recipe_embeddings 저장 중: {min(i + CHUNK_SIZE, len(item_rows))}/{len(item_rows)}")
+
+    print(f"recipe_embeddings 저장 완료: {len(item_rows)} rows")
 
     # recipe_embeddings
     item_rows = []

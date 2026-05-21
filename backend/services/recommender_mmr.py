@@ -3,8 +3,9 @@ import time
 import numpy as np
 from threading import RLock
 from typing import List, Optional, Set, Tuple
-
 from backend.extensions import db
+import os
+CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "true").lower() == "true"
 
 # =========================
 # 글로벌 캐시
@@ -40,6 +41,11 @@ def _load_all_recipe_embeddings(force: bool = False):
     global _RECIPE_IDS, _RECIPE_VECS, _RECIPE_LAST_LOAD
 
     now = time.time()
+
+    # CACHE_ENABLED=false면 항상 DB에서 새로 로딩
+    if not CACHE_ENABLED:
+        force = True
+
     if (not force) and _RECIPE_VECS is not None and (now - _RECIPE_LAST_LOAD) < _RECIPE_TTL_SEC:
         return
 

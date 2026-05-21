@@ -245,33 +245,33 @@ def save_embeddings_to_db(
     def vec_to_str(v: np.ndarray) -> str:
         return ",".join(f"{x:.6f}" for x in v.tolist())
 
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM user_embeddings"))
-        conn.execute(text("DELETE FROM recipe_embeddings"))
-
     user_rows = [
         {"user_id": int(user_id), "vector": vec_to_str(user_emb[idx])}
         for idx, user_id in idx2user.items()
     ]
-    with engine.begin() as conn:
-        conn.execute(
-            text("INSERT INTO user_embeddings (user_id, vector) VALUES (:user_id, :vector)"),
-            user_rows
-        )
-    print(f"user_embeddings 저장 완료: {len(user_rows)} rows")
-
     item_rows = [
         {"rcp_sno": int(item_id), "vector": vec_to_str(item_emb[idx])}
         for idx, item_id in idx2item.items()
     ]
 
     CHUNK_SIZE = 1000
+
+    # DELETE + INSERT 전체를 단일 트랜잭션으로 묶음
     with engine.begin() as conn:
+        conn.execute(text("DELETE FROM user_embeddings"))
+        conn.execute(text("DELETE FROM recipe_embeddings"))
+
+        conn.execute(
+            text("INSERT INTO user_embeddings (user_id, vector) VALUES (:user_id, :vector)"),
+            user_rows,
+        )
+        print(f"user_embeddings 저장 완료: {len(user_rows)} rows")
+
         for i in range(0, len(item_rows), CHUNK_SIZE):
             chunk = item_rows[i:i + CHUNK_SIZE]
             conn.execute(
                 text("INSERT INTO recipe_embeddings (rcp_sno, vector) VALUES (:rcp_sno, :vector)"),
-                chunk
+                chunk,
             )
             print(f"recipe_embeddings 저장 중: {min(i + CHUNK_SIZE, len(item_rows))}/{len(item_rows)}")
 

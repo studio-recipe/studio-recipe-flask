@@ -10,3 +10,4 @@ scikit-learn==1.5.2
 gunicorn==22.0.0
 cryptography==43.0.3
 prometheus-flask-exporter==0.23.1
+redis==5.0.8

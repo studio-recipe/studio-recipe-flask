@@ -14,4 +14,4 @@ SQLALCHEMY_TRACK_MODIFICATIONS = False
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB   = int(os.getenv("REDIS_DB",   "1"))     # DB 0은 Spring Boot 이메일 인증용
-REDIS_TTL  = int(os.getenv("REDIS_TTL",  "300"))   # 5분 TTL
+REDIS_TTL  = int(os.getenv("REDIS_TTL",  "1800"))

@@ -1,18 +1,14 @@
 import json
 import time
 import numpy as np
-from threading import RLock
 from typing import List, Optional, Set
 from backend.extensions import db
 import os
 import redis as redis_lib
 
 CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "true").lower() == "true"
-CACHE_BACKEND = os.environ.get("CACHE_BACKEND", "local")  # "local" or "redis"
 
-# =========================
 # Redis 연결
-# =========================
 _redis_client = None
 
 def _get_redis() -> Optional[redis_lib.Redis]:
@@ -37,9 +33,7 @@ def _get_redis() -> Optional[redis_lib.Redis]:
         _redis_client = None
         return None
 
-# =========================
 # Redis 임베딩 캐시
-# =========================
 def _redis_load_embeddings() -> Optional[tuple]:
     """
     Redis에서 임베딩 로딩
@@ -63,7 +57,6 @@ def _redis_load_embeddings() -> Optional[tuple]:
         return None
 
 def _redis_save_embeddings(ids: np.ndarray, vecs: np.ndarray):
-    """Redis에 임베딩 저장."""
     try:
         r = _get_redis()
         if r is None:
@@ -92,15 +85,7 @@ def _redis_invalidate_embeddings():
     except Exception as e:
         print(f"[REDIS] invalidate error: {e}")
 
-# =========================
-# 로컬 임베딩 캐시
-# =========================
-_CACHE_LOCK = RLock()
-_RECIPE_IDS = None
-_RECIPE_VECS = None
-_RECIPE_LAST_LOAD = 0.0
-_RECIPE_TTL_SEC = 300
-
+# 벡터 파싱 유틸
 def _to_vec(v):
     if v is None:
         return None
@@ -115,13 +100,9 @@ def _to_vec(v):
         return None
 
 def invalidate_recipe_cache():
-    global _RECIPE_IDS, _RECIPE_VECS, _RECIPE_LAST_LOAD
-    with _CACHE_LOCK:
-        _RECIPE_IDS = None
-        _RECIPE_VECS = None
-        _RECIPE_LAST_LOAD = 0.0
+    """재학습 후 Redis 캐시 삭제."""
     _redis_invalidate_embeddings()
-    print("[CACHE] all caches invalidated")
+    print("[CACHE] redis cache invalidated")
 
 def _load_from_db() -> tuple:
     """DB에서 임베딩 로딩."""
@@ -150,44 +131,27 @@ def _load_from_db() -> tuple:
     print(f"[DB] recipe_embeddings loaded N={len(ids)}, bad={bad}, tookMs={took}")
     return ids_arr, vecs_arr
 
-def _load_all_recipe_embeddings(force: bool = False):
-    global _RECIPE_IDS, _RECIPE_VECS, _RECIPE_LAST_LOAD
+def _load_all_recipe_embeddings(force: bool = False) -> tuple:
+    # 캐시 미사용/강제 재로딩: DB에서 읽고 Redis 갱신
+    if force or not CACHE_ENABLED:
+        ids, vecs = _load_from_db()
+        _redis_save_embeddings(ids, vecs)
+        return ids, vecs
 
-    now = time.time()
+    # Redis HIT
+    t0 = time.time()
+    result = _redis_load_embeddings()
+    if result is not None:
+        ids, vecs = result
+        took = int((time.time() - t0) * 1000)
+        print(f"[REDIS HIT] embeddings N={len(ids)} tookMs={took}")
+        return ids, vecs
 
-    if not CACHE_ENABLED:
-        force = True
-
-    # 로컬 캐시 유효 여부 확인
-    if (not force) and _RECIPE_VECS is not None and \
-       (now - _RECIPE_LAST_LOAD) < _RECIPE_TTL_SEC:
-        return
-
-    with _CACHE_LOCK:
-        now = time.time()
-        if (not force) and _RECIPE_VECS is not None and \
-           (now - _RECIPE_LAST_LOAD) < _RECIPE_TTL_SEC:
-            return
-
-        if CACHE_BACKEND == "redis":
-            # Redis에서 로딩 시도
-            t0 = time.time()
-            result = _redis_load_embeddings()
-            if result is not None and not force:
-                _RECIPE_IDS, _RECIPE_VECS = result
-                _RECIPE_LAST_LOAD = time.time()
-                took = int((time.time() - t0) * 1000)
-                print(f"[REDIS HIT] embeddings N={len(_RECIPE_IDS)} tookMs={took}")
-                return
-            # Redis 미스 → DB에서 로딩 후 Redis에 저장
-            print("[REDIS MISS] loading from DB...")
-            _RECIPE_IDS, _RECIPE_VECS = _load_from_db()
-            _redis_save_embeddings(_RECIPE_IDS, _RECIPE_VECS)
-        else:
-            # 로컬 캐시
-            _RECIPE_IDS, _RECIPE_VECS = _load_from_db()
-
-        _RECIPE_LAST_LOAD = time.time()
+    # Redis MISS → DB 로딩 후 Redis 적재
+    print("[REDIS MISS] loading from DB...")
+    ids, vecs = _load_from_db()
+    _redis_save_embeddings(ids, vecs)
+    return ids, vecs
 
 def _load_user_embedding(user_id: int) -> Optional[np.ndarray]:
     row = db.session.execute(
@@ -307,11 +271,7 @@ def recommend_mmr(
     exclude_ids=None
 ) -> List[int]:
     t0 = time.time()
-    _load_all_recipe_embeddings(force=False)
-
-    with _CACHE_LOCK:
-        ids = _RECIPE_IDS
-        X = _RECIPE_VECS
+    ids, X = _load_all_recipe_embeddings(force=False)
 
     if X is None or len(ids) == 0:
         return []
@@ -364,12 +324,12 @@ def recommend_mmr(
     )
 
     took = int((time.time() - t0) * 1000)
-    print(f"[RECOMMEND] user={user_id} k={k} backend={CACHE_BACKEND} tookMs={took}")
+    print(f"[RECOMMEND] user={user_id} k={k} tookMs={took}")
     return selected
 
 def warmup_recipe_cache(force: bool = True):
     try:
         _load_all_recipe_embeddings(force=force)
-        print(f"[WARMUP] recipe cache warmed up backend={CACHE_BACKEND}")
+        print("[WARMUP] recipe cache warmed up (redis)")
     except Exception as e:
         print(f"[WARMUP] failed: {e}")

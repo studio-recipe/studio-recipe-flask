@@ -9,8 +9,7 @@ K = 10
 LAMBDA_MMR = 0.8
 
 
-# ── 응답 헬퍼 ──────────────────────────────────────────────
-
+# 응답 헬퍼
 def _no_cache_json(payload, status=200):
     resp = make_response(jsonify(payload), status)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -36,8 +35,7 @@ def _empty_result(total_recipes=0, pos_table=None, reason=""):
     }
 
 
-# ── 평가 지표 계산 ──────────────────────────────────────────
-
+# 평가 지표 계산
 def _dcg(binary_rels):
     return sum(
         1.0 / ((i + 1) ** 0.5)
@@ -53,8 +51,7 @@ def _ndcg_at_k(rec_ids, gt_set, k):
     return dcg / idcg if idcg > 0 else 0.0
 
 
-# ── DB 헬퍼 ────────────────────────────────────────────────
-
+# DB 헬퍼
 def _find_positive_table(conn):
     """user_id + rcp_sno/recipe_id 컬럼을 가진 테이블 자동 탐색"""
     dbname = conn.execute(text("SELECT DATABASE()")).scalar()
@@ -90,7 +87,13 @@ def _get_total_recipe_count(conn):
         return 0
 
 
+# 수정 1: created_at까지 함께 로딩 
 def _load_user_positives(conn, table, user_col, recipe_col, max_users=200, min_pos=2):
+    """
+    반환 형식 변경:
+    기존: {uid: {rid1, rid2, ...}}                         (set, 시간순서 정보 없음)
+    변경: {uid: [(rid1, created_at1), (rid2, created_at2), ...]} (시간 내림차순 정렬된 list)
+    """
     user_rows = conn.execute(
         text(f"""
             SELECT {user_col} AS uid, COUNT(*) AS cnt
@@ -109,30 +112,47 @@ def _load_user_positives(conn, table, user_col, recipe_col, max_users=200, min_p
 
     pos_rows = conn.execute(
         text(f"""
-            SELECT {user_col} AS uid, {recipe_col} AS rid
+            SELECT {user_col} AS uid, {recipe_col} AS rid, created_at
             FROM {table}
             WHERE {user_col} IN :uids
+            ORDER BY {user_col}, created_at DESC
         """).bindparams(uids=tuple(users))
     ).fetchall()
 
     by_user = {}
-    for uid, rid in pos_rows:
+    for uid, rid, created_at in pos_rows:
         if uid is None or rid is None:
             continue
-        by_user.setdefault(int(uid), set()).add(int(rid))
+        by_user.setdefault(int(uid), []).append((int(rid), created_at))
     return by_user
 
 
-def _holdout_split(gt_set):
-    """leave-one-out: 가장 큰 id를 test로, 나머지를 train_seen으로"""
-    gt_list = sorted(int(x) for x in gt_set)
-    if len(gt_list) < 2:
+# ── 수정 2: PK 최댓값이 아닌 실제 최신 행동을 test로 분리 ──
+def _holdout_split(user_events):
+    """
+    leave-one-out: created_at 기준 가장 최근 행동 1건을 test로,
+    나머지를 train_seen으로 사용한다.
+
+    user_events: [(recipe_id, created_at), ...] — 이미 created_at DESC로 정렬되어 들어옴
+    """
+    # 같은 레시피 중복 행동(VIEW 여러 번 등) 제거 — 먼저 나온(=더 최근) 것 우선 유지
+    seen_rids = set()
+    deduped = []
+    for rid, created_at in user_events:
+        if rid in seen_rids:
+            continue
+        seen_rids.add(rid)
+        deduped.append((rid, created_at))
+
+    if len(deduped) < 2:
         return None, None
-    return gt_list[-1], set(gt_list[:-1])
+
+    test_item = deduped[0][0]                       # 가장 최근 행동
+    train_seen = {rid for rid, _ in deduped[1:]}     # 나머지 전부
+    return test_item, train_seen
 
 
-# ── 라우트 ─────────────────────────────────────────────────
-
+# 라우트 
 @bp.get("/api/admin/metrics")
 def admin_metrics():
     try:
@@ -164,10 +184,10 @@ def admin_metrics():
         union_recs = set()
         positives_total = users_evaluated = users_skipped = failed_users = 0
 
-        for uid, gt in pos_by_user.items():
-            positives_total += len(gt)
+        for uid, events in pos_by_user.items():
+            positives_total += len(events)
 
-            test_item, train_seen = _holdout_split(gt)
+            test_item, train_seen = _holdout_split(events)
             if test_item is None:
                 users_skipped += 1
                 continue
@@ -178,7 +198,7 @@ def admin_metrics():
                     k=K,
                     lambda_mmr=LAMBDA_MMR,
                     seed_recipe_id=None,
-                    filter_seen=True,
+                    filter_seen=False,  # train_seen으로 이미 제외했으므로 test_item을 후보에 남겨야 함
                     exclude_ids=train_seen,
                 )
             except Exception:

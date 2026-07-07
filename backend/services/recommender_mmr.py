@@ -8,13 +8,35 @@ import redis as redis_lib
 
 CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "true").lower() == "true"
 
-# Redis 연결
+# 캐시 미스 시 DB 재조회를 단 하나의 요청/워커만 수행하도록 하는 분산 락 설정
+_LOAD_LOCK_KEY = "recipe_embeddings:load_lock"
+_LOAD_LOCK_TTL_SEC = 60
+_LOAD_WAIT_POLL_MS = 100
+_LOAD_WAIT_MAX_RETRIES = 20  # 100ms * 20 = 최대 2초 대기
+
+# Redis 연결 (서킷 브레이커)
 _redis_client = None
+_redis_last_fail_ts = 0.0
+_REDIS_FAIL_COOLDOWN_SEC = float(os.environ.get("REDIS_FAIL_COOLDOWN_SEC", "5"))
+
+def _mark_redis_failed():
+    """
+    Redis 연결/명령 실패 시 클라이언트를 폐기하고 실패 시각을 기록한다.
+    이후 쿨다운 동안은 _get_redis()가 재연결 시도 없이 바로 None을 반환해
+    Redis 장애 중 매 요청마다 재연결 타임아웃을 반복해서 겪지 않도록 한다.
+    """
+    global _redis_client, _redis_last_fail_ts
+    _redis_client = None
+    _redis_last_fail_ts = time.time()
 
 def _get_redis() -> Optional[redis_lib.Redis]:
-    global _redis_client
+    global _redis_client, _redis_last_fail_ts
     if _redis_client is not None:
         return _redis_client
+
+    if time.time() - _redis_last_fail_ts < _REDIS_FAIL_COOLDOWN_SEC:
+        return None
+
     try:
         from backend.config import REDIS_HOST, REDIS_PORT, REDIS_DB
         _redis_client = redis_lib.Redis(
@@ -30,7 +52,7 @@ def _get_redis() -> Optional[redis_lib.Redis]:
         return _redis_client
     except Exception as e:
         print(f"[REDIS] connection failed: {e}")
-        _redis_client = None
+        _mark_redis_failed()
         return None
 
 # Redis 임베딩 캐시
@@ -54,6 +76,7 @@ def _redis_load_embeddings() -> Optional[tuple]:
         return ids, vecs
     except Exception as e:
         print(f"[REDIS] load embeddings error: {e}")
+        _mark_redis_failed()
         return None
 
 def _redis_save_embeddings(ids: np.ndarray, vecs: np.ndarray):
@@ -71,6 +94,7 @@ def _redis_save_embeddings(ids: np.ndarray, vecs: np.ndarray):
         print(f"[REDIS] embeddings saved N={len(ids)} size={size_mb:.2f}MB")
     except Exception as e:
         print(f"[REDIS] save embeddings error: {e}")
+        _mark_redis_failed()
 
 def _redis_invalidate_embeddings():
     """재학습 후 Redis 임베딩 캐시 삭제."""
@@ -84,6 +108,7 @@ def _redis_invalidate_embeddings():
         print("[REDIS] embeddings cache invalidated")
     except Exception as e:
         print(f"[REDIS] invalidate error: {e}")
+        _mark_redis_failed()
 
 # 벡터 파싱 유틸
 def _to_vec(v):
@@ -147,11 +172,27 @@ def _load_all_recipe_embeddings(force: bool = False) -> tuple:
         print(f"[REDIS HIT] embeddings N={len(ids)} tookMs={took}")
         return ids, vecs
 
-    # Redis MISS → DB 로딩 후 Redis 적재
+    # Redis MISS → 분산 락으로 단 하나의 요청만 DB 재조회 (캐시 스탬피드 방지)
     print("[REDIS MISS] loading from DB...")
-    ids, vecs = _load_from_db()
-    _redis_save_embeddings(ids, vecs)
-    return ids, vecs
+    if _try_acquire_load_lock():
+        try:
+            ids, vecs = _load_from_db()
+            _redis_save_embeddings(ids, vecs)
+        finally:
+            _release_load_lock()
+        return ids, vecs
+
+    # 락 획득 실패: 다른 요청/워커가 이미 채우는 중 → 짧게 폴링하며 대기
+    for _ in range(_LOAD_WAIT_MAX_RETRIES):
+        time.sleep(_LOAD_WAIT_POLL_MS / 1000)
+        result = _redis_load_embeddings()
+        if result is not None:
+            print("[REDIS] cache filled by another request while waiting for lock")
+            return result
+
+    # 최대 대기 시간을 넘겨도 안 채워짐(락 소유자 지연/실패) → 최후 수단으로 캐싱 없이 직접 DB 조회
+    print("[REDIS MISS] lock wait timed out, falling back to direct DB read (no cache write)")
+    return _load_from_db()
 
 def _load_user_embedding(user_id: int) -> Optional[np.ndarray]:
     row = db.session.execute(
@@ -333,3 +374,49 @@ def warmup_recipe_cache(force: bool = True):
         print("[WARMUP] recipe cache warmed up (redis)")
     except Exception as e:
         print(f"[WARMUP] failed: {e}")
+
+def _try_acquire_load_lock() -> bool:
+    """
+    여러 워커/프로세스가 동시에 DB 재조회(스케줄 refresh-ahead 또는 캐시 미스)를
+    실행하지 않도록 하는 분산 락. SET NX EX로 하나만 락을 획득해 DB 재조회 +
+    Redis 재적재를 수행하게 한다.
+    """
+    r = _get_redis()
+    if r is None:
+        return False
+    try:
+        return bool(r.set(_LOAD_LOCK_KEY, "1", nx=True, ex=_LOAD_LOCK_TTL_SEC))
+    except Exception as e:
+        print(f"[REDIS] load lock error: {e}")
+        _mark_redis_failed()
+        return False
+
+def _release_load_lock():
+    """작업이 끝나면 TTL 만료를 기다리지 않고 즉시 락을 반납한다."""
+    r = _get_redis()
+    if r is None:
+        return
+    try:
+        r.delete(_LOAD_LOCK_KEY)
+    except Exception as e:
+        print(f"[REDIS] load lock release error: {e}")
+        _mark_redis_failed()
+
+def refresh_ahead_job():
+    """
+    Redis 캐시 TTL이 만료되기 전에 주기적으로 미리 캐시를 재적재한다.
+    TTL 만료 시점에 다수의 요청이 동시에 캐시 미스를 겪고 각자 DB를
+    조회하는 캐시 스탬피드(thundering herd)를 방지하기 위한 refresh-ahead 전략.
+    """
+    if not CACHE_ENABLED:
+        return
+    if not _try_acquire_load_lock():
+        print("[REFRESH-AHEAD] skipped (lock held by another worker)")
+        return
+    try:
+        warmup_recipe_cache(force=True)
+        print("[REFRESH-AHEAD] recipe cache refreshed proactively")
+    except Exception as e:
+        print(f"[REFRESH-AHEAD] failed: {e}")
+    finally:
+        _release_load_lock()

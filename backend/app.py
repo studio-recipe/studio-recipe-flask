@@ -40,6 +40,31 @@ def create_app():
     except Exception as e:
         app.logger.warning(f"[WARMUP] recipe cache warmup failed: {e}")
 
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from backend.services.recommender_mmr import refresh_ahead_job
+        from backend.config import REDIS_TTL, REDIS_REFRESH_AHEAD_SEC
+
+        # TTL 만료 전에 미리 캐시를 갱신해 스탬피드를 방지 (refresh-ahead)
+        interval_sec = max(REDIS_TTL - REDIS_REFRESH_AHEAD_SEC, 60)
+
+        def _refresh_ahead_with_context():
+            with app.app_context():
+                refresh_ahead_job()
+
+        scheduler = BackgroundScheduler(daemon=True)
+        scheduler.add_job(
+            func=_refresh_ahead_with_context,
+            trigger="interval",
+            seconds=interval_sec,
+            id="recipe_cache_refresh_ahead",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.start()
+    except Exception as e:
+        app.logger.warning(f"[REFRESH-AHEAD] scheduler init failed: {e}")
+
     return app
 
 
